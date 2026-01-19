@@ -6,6 +6,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
 from chromstream.data_processing import integrate_channel
+from chromstream.data_processing import integrate_channelTP
 import logging as log
 
 
@@ -96,6 +97,23 @@ class Chromatogram:
         from .data_processing import integrate_single_chromatogram
 
         return integrate_single_chromatogram(self, peaklist, column=column)
+    
+    def integrate_peaksTP(self, peaklist: dict, column: None | str = None) -> dict:
+        """
+        Integrate peaks for this chromatogram
+
+        Args:
+            peaklist: Dictionary defining the peaks to integrate. Example:
+            Peaks_TCD = {"N2": [20, 26], "H2": [16, 19]}
+            The list values must be in the same unit as the chromatogram.
+            column: Optional column name to use for integration. If None, uses second column.
+
+        Returns:
+            Dictionary with integrated peak areas and timestamp
+        """
+        from .data_processing import integrate_single_chromatogramTP
+
+        return integrate_single_chromatogramTP(self, peaklist, column=column)    
 
 
 @dataclass
@@ -123,40 +141,90 @@ class ChannelChromatograms:
         """Add a chromatogram for a specific injection"""
         self.chromatograms[injection_num] = chromatogram
 
-    def plot(self, ax=None, colormap="viridis", plot_colorbar=True, **kwargs):
-        """Plotting all chromatograms of a channel channel"""
+    def plot(
+        self,
+        ax=None,
+        colormap="viridis",
+        plot_colorbar=True,
+        show_peaks=False,
+        peak_dict=None,
+        injection_range=None,
+        **kwargs,
+    ):
+        """Plotting all chromatograms of a channel, with optional peak annotations and injection range filtering."""
         if ax is None:
             fig, ax = plt.subplots()
-        colormap = plt.get_cmap(colormap)
-        colors = colormap(np.linspace(0, 1, len(self.chromatograms)))
 
-        for inj_num, chrom in self.chromatograms.items():
+        # Determine which chromatograms to plot
+        if injection_range is not None:
+            start, end = injection_range
+            chromatograms_to_plot = {
+                inj_num: chrom
+                for inj_num, chrom in self.chromatograms.items()
+                if start <= inj_num <= end
+            }
+        else:
+            chromatograms_to_plot = self.chromatograms
+
+        if len(chromatograms_to_plot) == 0:
+            ax.text(0.5, 0.5, "No chromatograms in range", ha="center", va="center")
+            ax.set_title(f"Channel: {self.channel}")
+            return ax
+
+        # Color map based on the filtered chromatograms
+        colormap = plt.get_cmap(colormap)
+        colors = colormap(np.linspace(0, 1, len(chromatograms_to_plot)))
+
+        # Plot chromatograms
+        for (inj_num, chrom), color in zip(chromatograms_to_plot.items(), colors):
             ax.plot(
                 chrom.data[chrom.data.columns[0]],
                 chrom.data[chrom.data.columns[1]],
                 label=f"Injection {inj_num}",
-                color=colors[inj_num],
+                color=color,
                 **kwargs,
             )
 
-        # Set labels and title (handle empty channel case)
-        if len(self.chromatograms) > 0:
-            # Use any chromatogram to get column names
-            sample_chrom = next(iter(self.chromatograms.values()))
-            ax.set_xlabel(sample_chrom.data.columns[0])
-            ax.set_ylabel(sample_chrom.data.columns[1])
-        else:
-            ax.set_xlabel("Time")
-            ax.set_ylabel("Signal")
+        # Set labels and title
+        sample_chrom = next(iter(chromatograms_to_plot.values()))
+        ax.set_xlabel(sample_chrom.data.columns[0])
+        ax.set_ylabel(sample_chrom.data.columns[1])
         ax.set_title(f"Channel: {self.channel}")
-        # add colorbar
+
+        # Add colorbar
         if plot_colorbar:
             sm = plt.cm.ScalarMappable(
-                norm=Normalize(vmin=0, vmax=len(self.chromatograms) - 1)
+                norm=Normalize(
+                    vmin=min(chromatograms_to_plot.keys()),
+                    vmax=max(chromatograms_to_plot.keys()),
+                )
             )
             sm.set_array([])
             cbar = plt.colorbar(sm, ax=ax)
             cbar.set_label("Injection Number")
+
+        # Optional: annotate peaks
+        if show_peaks and peak_dict:
+            matched_key = None
+            for key in peak_dict.keys():
+                if key.lower() in self.channel.lower():
+                    matched_key = key
+                    break
+
+            if matched_key and matched_key in peak_dict:
+                for compound, (start, end) in peak_dict[matched_key].items():
+                    ax.axvline(start, color="gray", linestyle="--", linewidth=1)
+                    ax.axvline(end, color="gray", linestyle="--", linewidth=1)
+                    ax.text(
+                        (start + end) / 2,
+                        ax.get_ylim()[1] * 0.9,
+                        compound,
+                        rotation=90,
+                        ha="center",
+                        va="top",
+                        fontsize=9,
+                        color="black",
+                    )
 
         return ax
 
@@ -202,6 +270,25 @@ class ChannelChromatograms:
         self.integrals = integrate_channel(self, peaklist, column=column)
         return self.integrals
 
+    def integrate_peaksTP(
+        self, peaklist: dict, column: None | str = None
+    ) -> pd.DataFrame:
+        """
+        Integrate peaks for all chromatograms in the channel
+
+        Args:
+            peaklist: Dictionary defining the peaks to integrate. Example:
+            Peaks_TCD = {"N2": [20, 26], "H2": [16, 19]}
+
+            The list values must be in the same unit as the chromatogram.
+
+            column: Optional column name to use for integration. If None, uses second column.
+
+        Returns:
+            DataFrame with integrated peak areas for each injection
+        """
+        self.integrals = integrate_channelTP(self, peaklist, column=column)
+        return self.integrals
 
 @dataclass
 class Experiment:
@@ -252,6 +339,68 @@ class Experiment:
 
         injection_num = len(self.channels[channel].chromatograms)
         self.channels[channel].add_chromatogram(injection_num, chrom)
+    
+    def save_to_csv(self, output_dir: str | Path):
+        """
+        Save all chromatograms in the experiment to CSV files, one per channel,
+        using Time as the index and each injection as a separate column.
+
+        Args:
+            output_dir (str | Path): Folder where the CSV files will be saved.
+        """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        for channel_name, channel_data in self.channels.items():
+            if not channel_data.chromatograms:
+                print(f"⚠️ No chromatograms found for channel '{channel_name}'. Skipping.")
+                continue
+            combined_df = None
+
+            for inj_num, chrom in channel_data.chromatograms.items():
+                df = chrom.data.copy()
+                time_col = df.columns[0]
+                signal_col = df.columns[1]
+
+                # Create new column using the injection time as column name
+                col_name = chrom.injection_time.strftime("%Y-%m-%d %H:%M:%S")
+                df = df.rename(columns={signal_col: col_name})
+                df = df.set_index(time_col)
+
+                # Combine into one wide DataFrame
+                if combined_df is None:
+                    combined_df = df[[col_name]]
+                else:
+                    combined_df = combined_df.join(df[[col_name]], how="outer")
+
+            # Save the combined DataFrame
+            output_path = output_dir / f"{self.name}_{channel_name}.csv"
+            combined_df.to_csv(output_path)
+            print(f"✅ Saved compact channel data to {output_path}")
+
+    def load_from_csv(self, csv_dir: str | Path):
+        """
+        Load chromatograms from compact CSV files (time as index, injections as columns).
+        """
+        csv_dir = Path(csv_dir)
+        for csv_file in csv_dir.glob(f"{self.name}_*.csv"):
+            channel_name = csv_file.stem.split(f"{self.name}_")[-1]
+            df = pd.read_csv(csv_file, index_col=0)
+            channel_obj = ChannelChromatograms(channel=channel_name)
+
+            for i, col in enumerate(df.columns):
+                injection_time = pd.to_datetime(col)
+                chrom = Chromatogram(
+                    data=pd.DataFrame({"Time (min)": df.index, "Value (mV)": df[col]}),
+                    injection_time=injection_time,
+                    metadata={},
+                    channel=channel_name,
+                    path=csv_file,
+                )
+                channel_obj.add_chromatogram(i, chrom)
+
+            self.channels[channel_name] = channel_obj
+            print(f"✅ Loaded channel '{channel_name}' from {csv_file}")
 
     def plot_chromatograms(self, ax=None, channels: str | list = "all", **kwargs):
         if ax is None:
@@ -347,6 +496,75 @@ class Experiment:
         ax.legend()
 
         return ax
+    def plot_logFT(self, gases=None, use_exp_time=False):
+        """
+        Plot pressure + temperature (top) and gas flows (bottom) from experiment log.
+
+        Parameters
+        ----------
+        gases : list of str, optional
+            List of gas names to plot (e.g., ['CO', 'H2', 'Ar']).
+            If None, plots all available gases found in the log.
+        plot_against : str, optional
+            Column to plot against — either 'Timestamp' or 'TOS'.
+            Default is 'Timestamp'.
+        """
+        log = getattr(self, "log", None)
+        if log is None or log.empty:
+            print("⚠️ No log data found.")
+            return
+
+        if use_exp_time:
+            if self.experiment_starttime is None:
+                raise ValueError(
+                    "Experiment start time is not set. Cannot use experiment time."
+                )
+            x = (
+                pd.to_datetime(self.log["Timestamp"]) - self.experiment_starttime
+            ).dt.total_seconds() / 60.0
+            x_label = "Experiment Time (min)"
+        else:
+            x = self.log["Timestamp"]
+            x_label = "Timestamp"
+        gas_map = {
+            'CO': 'MFC CO pv', 'H2': 'MFC H2 pv', 'Ar': 'MFC Ar pv',
+            'N2': 'MFC N2 pv', 'CO2': 'MFC CO2 pv', 'O2': 'MFC O2 pv', 'He': 'MFC He pv'
+        }
+
+        mfc_cols = [c for c in log.columns if 'MFC' in c and 'pv' in c]
+        if mfc_cols: log['Total Flow'] = log[mfc_cols].sum(axis=1)
+
+        gases = [g for g in (gases or gas_map) if gas_map.get(g) in log.columns]
+        gas_cols = [gas_map[g] for g in gases]
+
+        fig, (axP, axF) = plt.subplots(2, 1, figsize=(12, 9), sharex=True)
+
+        # --- Pressure & Temp ---
+        if 'Pressure R1' in log: axP.plot(x, log['Pressure R1'], 'b', label='Pressure (barg)')
+        if 'Oven PV' in log:
+            axT = axP.twinx()
+            axT.plot(x, log['Oven PV'], 'r', label='Oven Temp (°C)')
+            axT.set_ylabel('Oven Temp (°C)', color='r')
+            axT.tick_params(axis='y', labelcolor='r')
+        axP.set_ylabel('Pressure (barg)', color='b')
+        axP.tick_params(axis='y', labelcolor='b')
+        axP.set_title(f"Pressure & Oven Temp vs {x_label}")
+
+        # --- Gas flows ---
+        for col in gas_cols:
+            axF.plot(x, log[col], label=col)
+        if 'Total Flow' in log:
+            axF.plot(x, log['Total Flow'], 'k', lw=2, label='Total Flow')
+        axF.set_ylabel('Gas Flow (ml/min)')
+        axF.set_xlabel(x_label)
+        axF.legend(loc='upper right')
+        axF.set_title(f"Gas Flows vs {x_label}")
+
+        if x_label.lower() == 'tos':
+            axF.set_xticks(np.linspace(log['TOS'].min(), log['TOS'].max(), 10))
+
+        plt.tight_layout()
+        plt.show()
 
     @property
     def log_data(self) -> pd.DataFrame:

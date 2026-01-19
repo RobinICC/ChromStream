@@ -113,6 +113,51 @@ def linear_baseline(
 
     return data[signal_col] - baseline
 
+def two_point_baseline_jan(data: pd.DataFrame, peaks: dict) -> pd.Series:
+    """
+    Subtract a linear baseline between two specified time points for each peak.
+ 
+    Args:
+        data: DataFrame with time and signal columns
+        peaks: Dict of peak names to [start, end] time points
+ 
+    Returns:
+        Corrected signal as pandas Series
+    """
+    time_col, signal_col = data.columns[0], data.columns[1]
+    corrected_segments = []
+ 
+    for time_points in peaks.values():
+        if len(time_points) != 2:
+            raise ValueError("Each entry in peaks must contain exactly two values.")
+        start, end = time_points
+        start_time, end_time = time_points
+        time_col = data.columns[0]  # "Time (min)"
+        signal_col = data.columns[1]
+ 
+        # Find the closest data point to the specified time for both points
+        start_time_diff, end_time_diff = (data[time_col] - start_time).abs(), (data[time_col] - end_time).abs()
+        closest_index_start, closest_index_end = int(start_time_diff.idxmin()), int(end_time_diff.idxmin())
+ 
+        baseline_start = data.loc[[closest_index_start], signal_col].astype(float).values[0]
+        baseline_end = data.loc[[closest_index_end], signal_col].astype(float).values[0]
+ 
+        # Create a linear baseline between the two points
+        baseline = np.linspace(baseline_start, baseline_end, num=closest_index_end - closest_index_start + 1)
+        corrected_signal = data[signal_col].iloc[closest_index_start:closest_index_end + 1] - baseline
+        corrected_segments.append(corrected_signal)
+ 
+    # Concatenate all segments and sort by index
+    corrected_data = pd.concat(corrected_segments).sort_index()
+ 
+    # Fill missing indexes with original (uncorrected) values.
+    missing_indexes = data.index.difference(corrected_data.index)
+    uncorrected = data.loc[missing_indexes, data.columns[1]]
+    corrected_data = pd.concat([corrected_data, uncorrected]).sort_index()
+ 
+    # Return data between time_points with the baseline subtracted
+    return corrected_data if isinstance(corrected_data, pd.Series) else corrected_data[data.columns[1]]
+
 
 # Integration functions
 
@@ -152,7 +197,6 @@ def integrate_single_chromatogram(
 
     return injection_result
 
-
 def integrate_channel(
     chromatogram: ChannelChromatograms, peaklist: dict, column: None | str = None
 ) -> pd.DataFrame:
@@ -179,6 +223,73 @@ def integrate_channel(
 
     return pd.DataFrame(results)
 
+def integrate_single_chromatogramTP(
+    chromatogram: Chromatogram, 
+    peaklist: dict[str, tuple[float, float, bool]] | dict[str, tuple[float, float]], 
+    column: str | None = None
+) -> dict:
+    """
+    Integrate the signal of a single chromatogram over time with optional two-point baseline correction.
+
+    Args:
+        chromatogram: Chromatogram object containing the data to be analyzed
+        peaklist: Dictionary defining the peaks to integrate.
+                  Example with baseline: {"N2": [20, 26, True]}
+                  Example without: {"H2": [16, 19]}
+        column: Optional column name to use for integration. If None, uses second column.
+
+    Returns:
+        Dictionary with integrated peak areas and timestamp
+    """
+
+
+    data = chromatogram.data
+    time_col = data.columns[0]  # e.g., "Time (min)"
+    signal_col = column if column is not None else data.columns[1]
+
+    injection_result = {"Timestamp": chromatogram.injection_time}
+    for peak_name, window in peaklist.items():
+        # Handle both 2-element and 3-element entries
+        start, end = window[:2]
+        mask = (data[time_col] >= start) & (data[time_col] <= end)
+        x = data.loc[mask, time_col]
+        y = data.loc[mask, signal_col]
+        # Get start/end signal for linear baseline
+        y1, y2 = y.iloc[0], y.iloc[-1]
+        x1, x2 = x.iloc[0], x.iloc[-1]
+        slope = (y2 - y1) / (x2 - x1)
+        baseline = slope * (x - x1) + y1
+        y = y - baseline
+        area = trapezoid(y=y, x=x)
+        injection_result[peak_name] = area
+
+    return injection_result
+
+def integrate_channelTP(
+    chromatogram: ChannelChromatograms, peaklist: dict, column: None | str = None
+) -> pd.DataFrame:
+    """
+    Integrate the signal of a chromatogram over time.
+
+    Args:
+        chromatogram: ChannelChromatograms object containing the chromatograms to be analyzed
+        peaklist: Dictionary defining the peaks to integrate. Example:
+        ```
+        Peaks_TCD = {"N2": [20, 26], "H2": [16, 19]}
+        ```
+        The list values must be in the same unit as the chromatogram.
+        column: Optional column name to use for integration. If None, uses second column.
+    Returns:
+        DataFrame with integrated peak areas for each injection
+    """
+
+    results = []
+
+    for chrom in chromatogram.chromatograms.values():
+        injection_result = integrate_single_chromatogramTP(chrom, peaklist, column)
+        results.append(injection_result)
+
+    return pd.DataFrame(results)
 
 def get_temp_and_valves_MTO(Integral_Frame, Log):
     """
